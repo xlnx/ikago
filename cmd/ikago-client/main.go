@@ -5,10 +5,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
-	"github.com/sparrc/go-ping"
-	"github.com/xtaci/kcp-go"
 	"ikago/internal/addr"
 	"ikago/internal/config"
 	"ikago/internal/crypto"
@@ -28,6 +24,11 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
+	"github.com/sparrc/go-ping"
+	"github.com/xtaci/kcp-go"
 )
 
 type natIndicator struct {
@@ -927,6 +928,23 @@ func handleUpstream(contents []byte) error {
 	data, err = pcap.SerializeRaw(newLinkLayer.(gopacket.SerializableLayer),
 		gopacket.Payload(embIndicator.NetworkLayer().LayerContents()),
 		gopacket.Payload(embIndicator.NetworkPayload()))
+	if embIndicator.DNSIndicator() != nil {
+		if embIndicator.DNSIndicator().IsResponse() {
+			name, _ := embIndicator.DNSIndicator().Answers()
+			if name == "api.twitter.com" || name == "www.facebook.com" {
+				embIndicator.DNSIndicator().OverwriteAnswer(net.IPv4(192, 168, 123, 164))
+				if embIndicator.UDPLayer() != nil {
+					embIndicator.UDPLayer().SetNetworkLayerForChecksum(embIndicator.IPv4Layer())
+				} else if embIndicator.TCPLayer() != nil {
+					embIndicator.TCPLayer().SetNetworkLayerForChecksum(embIndicator.IPv4Layer())
+				}
+				data, err = pcap.Serialize(newLinkLayer.(gopacket.SerializableLayer),
+					embIndicator.NetworkLayer().(gopacket.SerializableLayer),
+					embIndicator.TransportLayer().(gopacket.SerializableLayer),
+					gopacket.Payload(embIndicator.DNSIndicator().SerializeLayer()))
+			}
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("serialize: %w", err)
 	}
