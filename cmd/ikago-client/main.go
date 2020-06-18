@@ -73,6 +73,7 @@ var (
 	argKCPInterval    = flag.Int("kcp-interval", kcp.IKCP_INTERVAL, "KCP tuning option interval.")
 	argKCPResend      = flag.Int("kcp-resend", 0, "KCP tuning option resend.")
 	argKCPNC          = flag.Int("kcp-nc", 0, "KCP tuning option nc.")
+	argShare          = flag.Bool("share", false, "Enable share.")
 	argPublish        = flag.String("publish", "", "ARP publishing address.")
 	argUpPort         = flag.Int("p", 0, "Port for routing upstream.")
 	argSources        = flag.String("r", "", "Sources.")
@@ -88,6 +89,7 @@ var (
 	listenDevs []*pcap.Device
 	upDev      *pcap.Device
 	gatewayDev *pcap.Device
+	share      bool
 	mode       string
 	crypt      crypto.Crypt
 	mtu        int
@@ -191,6 +193,7 @@ func main() {
 		cfg.KCPConfig.Interval = *argKCPInterval
 		cfg.KCPConfig.Resend = *argKCPResend
 		cfg.KCPConfig.NC = *argKCPNC
+		cfg.Share = *argShare
 		cfg.Publish = *argPublish
 		cfg.Port = *argUpPort
 		cfg.Sources = splitArg(*argSources)
@@ -330,6 +333,9 @@ func main() {
 	if publishIP != nil {
 		log.Infof("Publish %s\n", publishIP.IP)
 	}
+
+	// Share
+	share = cfg.Share
 
 	// Mode
 	switch cfg.Mode {
@@ -631,6 +637,20 @@ func open() error {
 		}
 		filter = filter + fmt.Sprintf(" || (arp[6:2] = 1 && %s)", s)
 	}
+	// capture share response
+	if share {
+		fs := make([]string, 0)
+		for _, f := range sources {
+			s, err := addr.DstBPFFilter(f)
+			if err != nil {
+				return fmt.Errorf("parse filter %s: %w", f, err)
+			}
+	
+			fs = append(fs, s)
+		}
+		f := strings.Join(fs, " || ")
+		filter = filter + fmt.Sprintf(" || (ip && ((%s) and src host %s))", f, upDev.IPAddrs()[0].IP)
+	}
 
 	// Handles for listening
 	for _, dev := range listenDevs {
@@ -824,8 +844,10 @@ func publish(packet gopacket.Packet, conn *pcap.RawConn) error {
 
 func handleListen(packet gopacket.Packet, conn *pcap.RawConn) error {
 	var (
-		hardwareAddr net.HardwareAddr
 		data         []byte
+		srcMAC       net.HardwareAddr
+		dstMAC       net.HardwareAddr
+		newLinkLayer gopacket.Layer
 	)
 
 	// Parse packet
@@ -843,24 +865,53 @@ func handleListen(packet gopacket.Packet, conn *pcap.RawConn) error {
 		return nil
 	}
 
-	// Record source hardware address
-	hardwareAddr = indicator.SrcHardwareAddr()
-
-	data = make([]byte, 0)
-	data = append(data, packet.NetworkLayer().LayerContents()...)
-	data = append(data, packet.NetworkLayer().LayerPayload()...)
-
-	// Write packet data
-	_, err = upConn.Write(data)
-	if err != nil {
-		return fmt.Errorf("write: %w", err)
+	// Check whether the packet is share
+	if share && indicator.SrcIP().Equal(upDev.IPAddrs()[0].IP) {
+		if ni, ok := nat[indicator.DstIP().String()]; ok {
+			dstMAC = ni.srcHardwareAddr
+		}
 	}
+	// Not share packet
+	if dstMAC == nil {
+		data = make([]byte, 0)
+		data = append(data, packet.NetworkLayer().LayerContents()...)
+		data = append(data, packet.NetworkLayer().LayerPayload()...)
+		// Write packet data
+		_, err = upConn.Write(data)
+		if err != nil {
+			return fmt.Errorf("write: %w", err)
+		}
+	} else {
+		// This packet is sent by us
+		if dstMAC.String() == indicator.DstHardwareAddr().String() {
+			return nil
+		}
+		newLinkLayer, err = pcap.CreateEthernetLayer(indicator.SrcHardwareAddr(), dstMAC, indicator.NetworkLayer().(gopacket.NetworkLayer))
+		if err != nil {
+			return fmt.Errorf("create link layer: %w", err)
+		}
+		// Serialize layers
+		data, err = pcap.SerializeRaw(newLinkLayer.(gopacket.SerializableLayer),
+			gopacket.Payload(indicator.NetworkLayer().LayerContents()),
+			gopacket.Payload(indicator.NetworkPayload()))
+		if err != nil {
+			return fmt.Errorf("serialize: %w", err)
+		}
+		// Write packet data
+		_, err = conn.Write(data)
+		if err != nil {
+			return fmt.Errorf("write: %w", err)
+		}
+	}
+
+	// Record source hardware address
+	srcMAC = indicator.SrcHardwareAddr()
 
 	// Record the connection of the packet
 	ni, ok := nat[indicator.SrcIP().String()]
-	if !ok || ni.srcHardwareAddr.String() != hardwareAddr.String() {
+	if !ok || ni.srcHardwareAddr.String() != srcMAC.String() {
 		natLock.Lock()
-		nat[indicator.SrcIP().String()] = &natIndicator{srcHardwareAddr: hardwareAddr, conn: conn}
+		nat[indicator.SrcIP().String()] = &natIndicator{srcHardwareAddr: srcMAC, conn: conn}
 		natLock.Unlock()
 	}
 
@@ -928,11 +979,12 @@ func handleUpstream(contents []byte) error {
 	data, err = pcap.SerializeRaw(newLinkLayer.(gopacket.SerializableLayer),
 		gopacket.Payload(embIndicator.NetworkLayer().LayerContents()),
 		gopacket.Payload(embIndicator.NetworkPayload()))
-	if embIndicator.DNSIndicator() != nil {
+	if share && embIndicator.DNSIndicator() != nil {
 		if embIndicator.DNSIndicator().IsResponse() {
 			name, _ := embIndicator.DNSIndicator().Answers()
 			if name == "api.twitter.com" || name == "www.facebook.com" {
-				embIndicator.DNSIndicator().OverwriteAnswer(net.IPv4(192, 168, 123, 164))
+				// redirect these to publish ip for capturing
+				embIndicator.DNSIndicator().OverwriteAnswer(upDev.IPAddrs()[0].IP)
 				if embIndicator.UDPLayer() != nil {
 					embIndicator.UDPLayer().SetNetworkLayerForChecksum(embIndicator.IPv4Layer())
 				} else if embIndicator.TCPLayer() != nil {

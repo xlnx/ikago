@@ -24,6 +24,7 @@ type Config struct {
 	MTU        int       `json:"mtu"`
 	KCP        bool      `json:"kcp"`
 	KCPConfig  KCPConfig `json:"kcp-tuning"`
+	Share      bool      `json:"share"`
 	Port       int       `json:"port"`
 	Publish    string    `json:"publish"`
 	Sources    []string  `json:"sources"`
